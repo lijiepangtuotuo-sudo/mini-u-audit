@@ -5,6 +5,7 @@ import { calculateAuditScore } from "./audit-score";
 import { getFaceFeatureVerdict, hasSeparateEyebrowEvidence } from "./face-rules";
 import { getBoxCoverage, isHeadOnlyFrame } from "./subject-coverage";
 import { countActiveRuns, getVisibleLimbVerdict } from "./structural-rules";
+import { getSupportedImageFile, isOutsideStage } from "./image-transfer";
 import "./manual-review.css";
 
 const auditTypes = [
@@ -797,11 +798,15 @@ function SummaryPill({ status, count }) {
 
 export function App() {
   const fileInputRef = useRef(null);
+  const stageRef = useRef(null);
   const imageFrameRef = useRef(null);
   const boxEditRef = useRef(null);
   const pendingBoxRef = useRef(null);
   const candidatesRef = useRef([]);
   const issueLibraryRef = useRef([]);
+  const fileDragDepthRef = useRef(0);
+  const imageDragRef = useRef(false);
+  const analysisRunRef = useRef(0);
   const [auditType, setAuditType] = useState("render");
   const [imageUrl, setImageUrl] = useState("");
   const [fileName, setFileName] = useState("");
@@ -817,6 +822,8 @@ export function App() {
   const [manualError, setManualError] = useState("");
   const [reportPreview, setReportPreview] = useState(false);
   const [reanalyzingId, setReanalyzingId] = useState(null);
+  const [fileDragOver, setFileDragOver] = useState(false);
+  const [draggingImage, setDraggingImage] = useState(false);
   const [issueLibrary, setIssueLibrary] = useState(() => JSON.parse(window.localStorage.getItem("mini-u-issue-library") || "[]"));
   const selected = candidates.find((candidate) => candidate.id === selectedId) ?? candidates[0];
   const counts = useMemo(() => ({ pass: candidates.filter((candidate) => candidate.status === "pass").length, review: candidates.filter((candidate) => candidate.status === "review").length, fail: candidates.filter((candidate) => candidate.status === "fail").length }), [candidates]);
@@ -886,19 +893,81 @@ export function App() {
   }, [auditType, imageUrl]);
 
   const runAnalysis = async (url, name = "待审核图片") => {
+    const runId = analysisRunRef.current + 1;
+    analysisRunRef.current = runId;
+    if (imageUrl.startsWith("blob:") && imageUrl !== url) URL.revokeObjectURL(imageUrl);
     setLoading(true); setImageUrl(url); setFileName(name); setCandidates([]); setSelectedId(null);
     try {
       const result = await detectPurpleRegions(url, auditType);
       const limbCheckedResult = await applyVisibleLimbChecks(url, auditType, result);
       const faceCheckedResult = await applyFaceChecks(url, limbCheckedResult);
       const strictResult = applyStrictRenderChecks(faceCheckedResult, auditType);
-      window.setTimeout(() => { const audited = applyIssueLibrary(strictResult, issueLibrary); setCandidates(audited); setSelectedId(audited[0]?.id ?? null); setLoading(false); }, 650);
+      if (runId !== analysisRunRef.current) return;
+      window.setTimeout(() => {
+        if (runId !== analysisRunRef.current) return;
+        const audited = applyIssueLibrary(strictResult, issueLibrary);
+        setCandidates(audited); setSelectedId(audited[0]?.id ?? null); setLoading(false);
+      }, 650);
     } catch {
+      if (runId !== analysisRunRef.current) return;
       const fallback = applyStrictRenderChecks([makeCandidate({ id: 1, type: auditType, confidence: 55, score: 75, box: { x: 24, y: 18, w: 52, h: 64 } })], auditType);
       setCandidates(fallback); setSelectedId(1); setLoading(false);
     }
   };
-  const handleUpload = (event) => { const file = event.target.files?.[0]; if (file) runAnalysis(URL.createObjectURL(file), file.name); };
+  const uploadFile = (file) => {
+    const imageFile = getSupportedImageFile([file]);
+    if (imageFile) runAnalysis(URL.createObjectURL(imageFile), imageFile.name);
+  };
+  const handleUpload = (event) => {
+    uploadFile(event.target.files?.[0]);
+    event.target.value = "";
+  };
+  const clearCurrentImage = () => {
+    analysisRunRef.current += 1;
+    if (imageUrl.startsWith("blob:")) URL.revokeObjectURL(imageUrl);
+    setImageUrl(""); setFileName(""); setCandidates([]); setSelectedId(null); setLoading(false);
+    setAdding(false); setReanalyzingId(null); setManualMode(false); setReportPreview(false);
+  };
+  const hasFiles = (dataTransfer) => Array.from(dataTransfer?.types ?? []).includes("Files");
+  const handleStageDragEnter = (event) => {
+    if (!hasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    fileDragDepthRef.current += 1;
+    setFileDragOver(true);
+  };
+  const handleStageDragOver = (event) => {
+    if (!hasFiles(event.dataTransfer) && !imageDragRef.current) return;
+    event.preventDefault();
+    if (hasFiles(event.dataTransfer)) event.dataTransfer.dropEffect = "copy";
+  };
+  const handleStageDragLeave = (event) => {
+    if (!hasFiles(event.dataTransfer)) return;
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (!fileDragDepthRef.current) setFileDragOver(false);
+  };
+  const handleStageDrop = (event) => {
+    const droppedFiles = event.dataTransfer?.files;
+    if (droppedFiles?.length) {
+      event.preventDefault();
+      fileDragDepthRef.current = 0; setFileDragOver(false);
+      const droppedFile = getSupportedImageFile(droppedFiles);
+      if (droppedFile) uploadFile(droppedFile);
+      return;
+    }
+    if (imageDragRef.current) event.preventDefault();
+  };
+  const handleImageDragStart = (event) => {
+    imageDragRef.current = true;
+    setDraggingImage(true);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", "mini-u-audit-source-image");
+  };
+  const handleImageDragEnd = (event) => {
+    const shouldClear = imageDragRef.current && isOutsideStage(event, stageRef.current?.getBoundingClientRect());
+    imageDragRef.current = false;
+    setDraggingImage(false);
+    if (shouldClear) clearCurrentImage();
+  };
   const updateCandidate = (id, updater) => setCandidates((items) => items.map((item) => (item.id === id ? updater(item) : item)));
   const openManualMode = () => {
     setManualDecision("review");
@@ -968,7 +1037,7 @@ export function App() {
     <section className="control-strip" aria-label="审核设置"><div className="section-kicker"><span>1</span>选择审核类型</div><div className="type-grid">{auditTypes.map((type) => { const Icon = type.icon; const active = auditType === type.id; return <button type="button" className={`audit-type ${active ? "active" : ""}`} key={type.id} onClick={() => setAuditType(type.id)} aria-pressed={active}><Icon size={18} /><span><strong>{type.label}</strong><small>{type.note}</small></span>{active && <span className="selected-chip"><Check size={12} />已选</span>}</button>; })}</div><input ref={fileInputRef} className="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp" onChange={handleUpload} /><button type="button" className="upload-button" onClick={() => fileInputRef.current?.click()}><Upload size={18} />上传图片</button></section>
     <section className="workbench">
       <aside className="left-rail panel"><div className="panel-heading"><div><span className="step-dot" />角色列表</div><span>{candidates.length} 个</span></div><div className="summary-row"><SummaryPill status="pass" count={counts.pass} /><SummaryPill status="review" count={counts.review} /><SummaryPill status="fail" count={counts.fail} /></div><div className="candidate-list">{loading && <div className="empty-list"><LoaderCircle className="spin" size={18} />正在识别角色</div>}{!loading && !candidates.length && <div className="empty-list">上传图片后，系统会在这里列出疑似小 U</div>}{candidates.map((candidate) => { const meta = statusMeta[candidate.status]; const Icon = meta.Icon; return <button type="button" className={`candidate-row ${selected?.id === candidate.id ? "selected" : ""}`} key={candidate.id} onClick={() => setSelectedId(candidate.id)}><span className={`candidate-number ${meta.tone}`}>{candidate.id}</span><span className="candidate-copy"><strong>{candidate.name}</strong><small>{candidate.pose} · 置信度 {candidate.confidence}%</small></span><span className={`row-score ${meta.tone}`}><Icon size={14} />{candidate.score}</span></button>; })}</div><div className="rail-actions"><button type="button" className={`quiet-button ${adding ? "active" : ""}`} onClick={() => setAdding((value) => !value)} disabled={!imageUrl} title="手动补充角色框"><Plus size={16} />{adding ? "点击图片添加" : "添加角色"}</button><button type="button" className="quiet-button" onClick={() => imageUrl && runAnalysis(imageUrl, fileName)} disabled={!imageUrl} title="重新运行本地识别"><RefreshCw size={16} />重新分析</button></div></aside>
-      <section className="stage-panel panel"><div className="panel-heading"><div><span className="step-dot" />原图标注 <small>{imageUrl ? `· ${fileName}` : "· 等待上传"}</small></div><span>可拖动、拉伸与删除</span></div><div className="image-stage">{imageUrl ? <><div ref={imageFrameRef} className={`image-frame ${adding ? "adding" : ""}`} onClick={addCandidate}><img src={imageUrl} alt="待审核的小 U 图片" />{showGuides && candidates.map((candidate) => { const meta = statusMeta[candidate.status]; return <div role="button" tabIndex={0} key={candidate.id} className={`subject-box ${meta.tone} ${selected?.id === candidate.id ? "selected" : ""}`} style={{ left: `${candidate.box.x}%`, top: `${candidate.box.y}%`, width: `${candidate.box.w}%`, height: `${candidate.box.h}%` }} onPointerDown={(event) => startBoxEdit(event, candidate, "move")} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedId(candidate.id); }} aria-label={`调整${candidate.name}的角色框`}><span>{candidate.name} · {candidate.pose}</span><button type="button" className="box-delete" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); removeCandidate(candidate.id); }} aria-label={`删除${candidate.name}`} title="删除此角色框"><X size={12} /></button>{["nw", "ne", "sw", "se"].map((handle) => <i key={handle} className={`resize-handle ${handle}`} onPointerDown={(event) => startBoxEdit(event, candidate, handle)} aria-hidden="true" />)}{reanalyzingId === candidate.id ? <em>重算中</em> : candidate.reanalysisNote ? <em>已复算</em> : candidate.source === "manual" && <em>已调整</em>}</div>; })}</div>{loading && <div className="stage-loading"><LoaderCircle className="spin" size={24} />正在查找紫蓝色主体与角色轮廓</div>}</> : <div className="upload-empty" onClick={() => fileInputRef.current?.click()}><ImagePlus size={34} /><strong>上传待审核图片</strong><span>支持 PNG、JPG、WEBP；上传后自动标注疑似小 U</span></div>}</div><div className="stage-footer stage-footer-compact"><span>{reanalyzingId ? "框选范围已变化，正在按新区域复算" : "拖动或缩放角色框后会自动复算当前角色"}</span><button type="button" className="icon-text-button" onClick={() => setShowGuides((value) => !value)} title="显示或隐藏角色框"><Eye size={16} />{showGuides ? "隐藏标注" : "显示标注"}</button></div></section>
+      <section className="stage-panel panel"><div className="panel-heading"><div><span className="step-dot" />原图标注 <small>{imageUrl ? `· ${fileName}` : "· 等待上传"}</small></div><span>可拖动、拉伸与删除</span></div><div ref={stageRef} className={`image-stage ${fileDragOver ? "file-drag-over" : ""}`} onDragEnter={handleStageDragEnter} onDragOver={handleStageDragOver} onDragLeave={handleStageDragLeave} onDrop={handleStageDrop}>{imageUrl ? <><div ref={imageFrameRef} className={`image-frame ${adding ? "adding" : ""} ${draggingImage ? "dragging-image" : ""}`} onClick={addCandidate}><img src={imageUrl} alt="待审核的小 U 图片" draggable={!adding} onDragStart={handleImageDragStart} onDragEnd={handleImageDragEnd} />{showGuides && candidates.map((candidate) => { const meta = statusMeta[candidate.status]; return <div role="button" tabIndex={0} key={candidate.id} className={`subject-box ${meta.tone} ${selected?.id === candidate.id ? "selected" : ""}`} style={{ left: `${candidate.box.x}%`, top: `${candidate.box.y}%`, width: `${candidate.box.w}%`, height: `${candidate.box.h}%` }} onPointerDown={(event) => startBoxEdit(event, candidate, "move")} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedId(candidate.id); }} aria-label={`调整${candidate.name}的角色框`}><span>{candidate.name} · {candidate.pose}</span><button type="button" className="box-delete" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); removeCandidate(candidate.id); }} aria-label={`删除${candidate.name}`} title="删除此角色框"><X size={12} /></button>{["nw", "ne", "sw", "se"].map((handle) => <i key={handle} className={`resize-handle ${handle}`} onPointerDown={(event) => startBoxEdit(event, candidate, handle)} aria-hidden="true" />)}{reanalyzingId === candidate.id ? <em>重算中</em> : candidate.reanalysisNote ? <em>已复算</em> : candidate.source === "manual" && <em>已调整</em>}</div>; })}</div>{loading && <div className="stage-loading"><LoaderCircle className="spin" size={24} />正在查找紫蓝色主体与角色轮廓</div>}</> : <div className="upload-empty" onClick={() => fileInputRef.current?.click()}><ImagePlus size={34} /><strong>拖入或上传待审核图片</strong><span>支持 PNG、JPG、WEBP；上传后自动标注疑似小 U</span></div>}{fileDragOver && <div className="file-drop-message"><ImagePlus size={24} />松开即可上传图片</div>}</div><div className="stage-footer stage-footer-compact"><span>{reanalyzingId ? "框选范围已变化，正在按新区域复算" : imageUrl ? "拖入图片可替换；拖动原图离开画板可清空当前图片" : "可将图片拖入画板，或点击上传"}</span><button type="button" className="icon-text-button" onClick={() => setShowGuides((value) => !value)} title="显示或隐藏角色框"><Eye size={16} />{showGuides ? "隐藏标注" : "显示标注"}</button></div></section>
       <aside className="detail-panel panel"><div className="panel-heading"><div><span className="step-dot" />审核结论</div>{selected && <span>{selected.pose}</span>}</div>{!selected ? <div className="detail-empty"><ScanSearch size={30} /><strong>等待识别结果</strong><span>选择一张图片后，这里会显示每个小 U 的审核依据。</span></div> : <div className="detail-content"><div className={`result-card ${selected.status}`}><div className={`score-ring ${selected.status}`}>{selected.score}<small>分</small></div><div><p>{statusMeta[selected.status].label}</p><span>识别置信度 {selected.confidence}%</span></div><button type="button" className="manual-button" onClick={openManualMode}><PenLine size={14} />人工改判</button></div>{manualMode && <section className="manual-actions" aria-label="人工改判记录"><span>1. 设置所选维度结论</span><div className="manual-statuses">{Object.keys(statusMeta).map((status) => <button type="button" key={status} className={`${status} ${manualDecision === status ? "selected" : ""}`} onClick={() => { setManualDecision(status); setManualError(""); }} aria-pressed={manualDecision === status}>{statusMeta[status].label}</button>)}</div><span>2. 选择对应维度 <b>必选</b></span><div className="dimension-options">{selected.checks.filter((check) => check.state !== "na").map((check) => <button type="button" key={check.id} className={manualDimensions.includes(check.id) ? "selected" : ""} onClick={() => { toggleManualDimension(check.id); setManualError(""); }} aria-pressed={manualDimensions.includes(check.id)}>{check.label}</button>)}</div><label className="manual-reason"><span>3. {manualDecision === "pass" ? "通过依据" : manualDecision === "fail" ? "不通过问题点" : "复核问题点"} <b>必填</b></span><textarea value={manualReason} onChange={(event) => { setManualReason(event.target.value); setManualError(""); }} placeholder={manualDecision === "pass" ? "例如：已逐项确认手指、下肢与比例符合规范" : "例如：右手手指数量异常，下肢长度与身体比例失调"} /></label>{manualError && <p className="manual-error">{manualError}</p>}<div className="manual-submit-row"><small><ListChecks size={13} />仅改动所选维度；记录会保存到问题库</small><button type="button" onClick={submitManualDecision}>提交改判</button></div></section>}<div className="reason-box"><strong>本次结论</strong>{selected.reasons.map((reason) => <p key={reason}><span />{reason}</p>)}{selected.reanalysisNote && <small>{selected.reanalysisNote}</small>}{selected.manualNote && <small>{selected.manualNote}</small>}</div>{selected.reviewHints.length > 0 && <div className="review-hints"><strong>历史复核重点</strong>{selected.reviewHints.map((hint) => <p key={hint}>{hint}</p>)}</div>}<div className="library-status"><ListChecks size={15} /><span>审核问题库已沉淀 {issueLibrary.length} 条记录</span></div><div className="checks-heading">检测维度 <span>得分 × 权重</span></div><div className="check-list">{selected.checks.map((check) => <div className={`check-card ${check.state}`} key={check.id}><div className="check-title"><span>{check.state === "pass" ? <Check size={14} /> : check.state === "na" ? <ChevronDown size={14} /> : <CircleAlert size={14} />}</span><strong>{check.label}</strong><b>{check.score === null ? check.state === "review" ? "待核验" : "不适用" : `${check.score} 分 × ${check.weight}%`}</b></div><p>{check.note}</p></div>)}</div><button type="button" className="remove-button" onClick={removeSelected}><CircleX size={15} />移除误识别角色</button></div>}</aside>
     </section>
     <section className="report-bar panel"><div><span className="step-dot" />审核报告 <small>{candidates.length ? "包含角色框、各维度结果、人工改判和问题库；导出为 JSON 文件" : "完成审核后自动汇总"}</small></div><div className="report-actions"><span>{counts.fail > 0 ? "存在不通过素材，建议退回修改" : counts.review > 0 ? "存在待确认素材，建议设计师复核" : candidates.length ? "本次素材可进入下一步" : ""}</span><button type="button" className="report-preview-button" onClick={() => setReportPreview(true)} disabled={!candidates.length}><FileText size={16} />预览报告</button><button type="button" className="export-button" onClick={exportReport} disabled={!candidates.length}><Download size={16} />导出 JSON</button></div></section>
