@@ -8,3 +8,9 @@ export function getBoxCoverage(box, subject) {
   const subjectArea = subject.w * subject.h;
   return subjectArea ? (overlapWidth * overlapHeight) / subjectArea : 0;
 }
+
+export function isHeadOnlyFrame(coverage, visibleLowerLimbCount) {
+  // A small but complete mascot can occupy only part of a source image. Treat a box as partial
+  // only when its own crop has no visible lower body, not merely because the full-image bounds are larger.
+  return coverage < 0.76 && visibleLowerLimbCount === 0;
+}

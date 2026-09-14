@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BadgeCheck, Check, ChevronDown, CircleAlert, CircleCheck, CircleX, Download, Eye, FileImage, FileText, ImagePlus, ListChecks, LoaderCircle, PenLine, Plus, RefreshCw, ScanSearch, Sparkles, Upload, X } from "lucide-react";
 import { calculateBoxEdit } from "./box-edit";
-import { getBoxCoverage } from "./subject-coverage";
-import { countActiveRuns, hasUnoccludedLowerLimbFailure } from "./structural-rules";
+import { calculateAuditScore } from "./audit-score";
+import { getFaceFeatureVerdict, hasSeparateEyebrowEvidence } from "./face-rules";
+import { getBoxCoverage, isHeadOnlyFrame } from "./subject-coverage";
+import { countActiveRuns, getVisibleLimbVerdict } from "./structural-rules";
 import "./manual-review.css";
 
 const auditTypes = [
@@ -22,7 +24,7 @@ const renderChecks = [
   { id: "color", label: "紫蓝渐变配色", weight: 18 },
   { id: "material", label: "材质质感", weight: 15 },
   { id: "glasses", label: "白色圆框眼镜", weight: 15 },
-  { id: "face", label: "五官与表情", weight: 10 },
+  { id: "face", label: "五官与表情（眉毛、双眼、嘴巴）", weight: 10 },
   { id: "limbs", label: "四肢结构", weight: 10 },
   { id: "accessories", label: "场景配件合规性", weight: 10 },
 ];
@@ -31,7 +33,7 @@ const lineChecks = [
   { id: "outline", label: "U 型轮廓与顶部凹槽", weight: 28 },
   { id: "proportion", label: "身体与四肢比例", weight: 22 },
   { id: "glasses", label: "圆框眼镜位置与结构", weight: 20 },
-  { id: "face", label: "五官与表情位置", weight: 16 },
+  { id: "face", label: "五官与表情（眉毛、双眼、嘴巴）", weight: 16 },
   { id: "linework", label: "线条闭合与结构关系", weight: 14 },
 ];
 
@@ -43,7 +45,7 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const trustedSources = new Set(["reference", "trusted-line"]);
 
 function getStatus(score, confidence, source) {
-  // Local colour-and-contour detection cannot prove fingers, lower limbs, or body proportion.
+  // Local colour-and-contour detection cannot prove fingers or facial/material details.
   // Until a structural vision model confirms those traits, every generated candidate stays in review.
   if (!trustedSources.has(source)) return "review";
   if (confidence < 72 || score < 82) return "review";
@@ -56,10 +58,10 @@ function createChecks(type, pose, score, confidence, source) {
   return getAuditChecks(type).map((check) => {
     if (sideOrBack && ["glasses", "face"].includes(check.id)) return { ...check, score: null, state: "na", note: pose === "背面" ? "背面视图不检查正脸五官" : "侧面仅检查可见结构" };
     if (!trusted && check.id === "material") return { ...check, score: null, state: "review", note: "材质高光与软胶感尚未完成参考图比对，禁止自动通过" };
-    if (!trusted && ["limbs", "proportion"].includes(check.id)) return { ...check, score: null, state: "review", note: type === "line" ? "身体、手脚比例与连接关系需由视觉模型或设计师确认" : "手指、下肢与身体比例尚未完成结构识别，禁止自动通过" };
+    if (!trusted && ["limbs", "proportion"].includes(check.id)) return { ...check, score: null, state: "review", note: type === "line" ? "身体、手脚比例与连接关系需由视觉模型或设计师确认" : "正在按当前框检测可见下肢与身体连接；手部细节仍需人工确认" };
     if (!trusted && check.id === "face") return { ...check, score: null, state: "review", note: type === "line" ? "眼睛、嘴巴及其相对位置需由视觉模型或设计师确认" : "表情细节需由视觉模型或设计师确认" };
     if (!trusted && check.id === "linework") return { ...check, score: null, state: "review", note: "线条闭合、交叠和肢体连接关系需人工确认" };
-    if (!trusted && check.id === "accessories") return { ...check, score: null, state: "review", note: "耳机、麦克风、书本等可作为场景配件；仅在遮挡角色结构或替代关键部件时复核" };
+    if (check.id === "accessories") return { ...check, score: 100, state: "pass", note: "配件为可选项；没有配件本身合规。仅当道具遮挡五官或四肢时，才由对应维度提示复核" };
     const adjustment = check.id === "outline" ? 3 : 0;
     const itemScore = clamp(Math.round(score + adjustment), 55, 100);
     return {
@@ -107,11 +109,11 @@ function makeLineTypeMismatchCandidate({ id = 1, type, pose = "正面", box = { 
 
 function makeCandidate({ id, box, type, pose = "正面", confidence = 86, score = 90, source = "auto" }) {
   const status = getStatus(score, confidence, source);
-  const displayedScore = status === "review" && !trustedSources.has(source) ? Math.min(score, 78) : score;
+  const checks = createChecks(type, pose, score, confidence, source);
   return {
-    id, name: `小 U-${id}`, box, pose, confidence, score: displayedScore, status, source,
-    checks: createChecks(type, pose, score, confidence, source),
-    reasons: status === "pass" ? [type === "line" ? "关键轮廓、比例、圆框眼镜与线条结构符合线稿规范" : "关键轮廓、配色与五官符合当前审核类型的规范"] : source !== "reference" ? [type === "line" ? "当前只完成了线稿主体定位，不能据此确认完整人物合格" : "当前只完成了主体定位与基础色彩判断，不能据此确认完整人物合格", "手指、下肢和身体比例未完成结构识别，必须人工复核或接入视觉模型"] : ["检测结果存在不确定性，建议设计师确认后再使用", "已保留问题框，便于快速复核"],
+    id, name: `小 U-${id}`, box, pose, confidence, score: calculateAuditScore(checks, score), status, source,
+    checks,
+    reasons: status === "pass" ? [type === "line" ? "关键轮廓、比例、圆框眼镜与线条结构符合线稿规范" : "关键轮廓、配色与五官符合当前审核类型的规范"] : source !== "reference" ? [type === "line" ? "当前只完成了线稿主体定位，不能据此确认完整人物合格" : "当前只完成了主体定位与基础色彩判断，不能据此确认完整人物合格", "材质、表情与手部细节未完成可靠结构识别，必须人工复核或接入视觉模型"] : ["检测结果存在不确定性，建议设计师确认后再使用", "已保留问题框，便于快速复核"],
     reviewHints: [],
     manualNote: "",
     reanalysisNote: "",
@@ -133,10 +135,10 @@ function applyStrictRenderChecks(candidates, auditType) {
   if (auditType !== "render") return candidates;
   return candidates.map((candidate) => {
     if (trustedSources.has(candidate.source)) return candidate;
-    const strictReasons = ["严格 3D 审核已启用：材质、表情与四肢不能仅凭基础像素自动放行"];
+    const strictReasons = ["严格 3D 审核已启用：材质、表情与手部细节不能仅凭基础像素自动放行"];
     if (candidate.status === "fail") return { ...candidate, reasons: [...strictReasons, ...candidate.reasons] };
     const status = "review";
-    return { ...candidate, status, score: Math.min(candidate.score, 80), reasons: [...strictReasons, ...candidate.reasons] };
+    return { ...candidate, status, reasons: [...strictReasons, ...candidate.reasons] };
   });
 }
 
@@ -344,6 +346,116 @@ function getLowerLimbCount(data, width, height, subjectBounds) {
   return countActiveRuns(columns, 2);
 }
 
+function getDarkBandEvidence(data, width, height, bounds) {
+  const left = clamp(Math.floor(bounds.x * width), 0, width - 1);
+  const right = clamp(Math.ceil((bounds.x + bounds.w) * width), left + 1, width);
+  const top = clamp(Math.floor(bounds.y * height), 0, height - 1);
+  const bottom = clamp(Math.ceil((bounds.y + bounds.h) * height), top + 1, height);
+  const regionWidth = right - left;
+  const regionHeight = bottom - top;
+  const activeColumns = [];
+  let darkPixels = 0;
+  // The mouth is a thin curve. At the review resolution it may only occupy two pixels per column.
+  const columnFloor = Math.max(1, Math.ceil(regionHeight * 0.035));
+
+  for (let x = left; x < right; x += 1) {
+    let columnDarkPixels = 0;
+    for (let y = top; y < bottom; y += 1) {
+      const index = (y * width + x) * 4;
+      if (!isDarkLinePixel(data[index], data[index + 1], data[index + 2])) continue;
+      darkPixels += 1;
+      columnDarkPixels += 1;
+    }
+    activeColumns.push(columnDarkPixels >= columnFloor);
+  }
+
+  return {
+    inkRatio: darkPixels / Math.max(1, regionWidth * regionHeight),
+    runCount: countActiveRuns(activeColumns, Math.max(2, Math.ceil(regionWidth * 0.025))),
+    activeRatio: activeColumns.filter(Boolean).length / Math.max(1, activeColumns.length),
+  };
+}
+
+function getDarkComponents(data, width, height, bounds) {
+  const left = clamp(Math.floor(bounds.x * width), 0, width - 1);
+  const right = clamp(Math.ceil((bounds.x + bounds.w) * width), left + 1, width);
+  const top = clamp(Math.floor(bounds.y * height), 0, height - 1);
+  const bottom = clamp(Math.ceil((bounds.y + bounds.h) * height), top + 1, height);
+  const regionWidth = right - left;
+  const regionHeight = bottom - top;
+  const mask = new Uint8Array(regionWidth * regionHeight);
+  const visited = new Uint8Array(mask.length);
+
+  for (let y = 0; y < regionHeight; y += 1) for (let x = 0; x < regionWidth; x += 1) {
+    const index = ((top + y) * width + left + x) * 4;
+    if (isDarkLinePixel(data[index], data[index + 1], data[index + 2])) mask[y * regionWidth + x] = 1;
+  }
+
+  const components = [];
+  for (let start = 0; start < mask.length; start += 1) {
+    if (!mask[start] || visited[start]) continue;
+    const queue = [start];
+    visited[start] = 1;
+    let minX = regionWidth; let maxX = 0; let minY = regionHeight; let maxY = 0; let area = 0;
+    const rowPixels = new Map();
+    while (queue.length) {
+      const current = queue.pop();
+      const x = current % regionWidth;
+      const y = Math.floor(current / regionWidth);
+      area += 1;
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+      rowPixels.set(y, (rowPixels.get(y) || 0) + 1);
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
+        const nextX = x + dx; const nextY = y + dy;
+        if (nextX < 0 || nextX >= regionWidth || nextY < 0 || nextY >= regionHeight) continue;
+        const next = nextY * regionWidth + nextX;
+        if (mask[next] && !visited[next]) { visited[next] = 1; queue.push(next); }
+      }
+    }
+    const componentWidth = maxX - minX + 1;
+    const componentHeight = maxY - minY + 1;
+    const splitRow = minY + Math.ceil(componentHeight * 0.46);
+    let topWidth = 0; let lowerWidth = 0;
+    for (const [row, pixelCount] of rowPixels) {
+      if (row < splitRow) topWidth = Math.max(topWidth, pixelCount);
+      else lowerWidth = Math.max(lowerWidth, pixelCount);
+    }
+    if (area >= 5) components.push({ area, aspect: componentWidth / componentHeight, componentHeight, topWidth, lowerWidth });
+  }
+  return components;
+}
+
+function getFaceFeatureSignals(data, width, height, subjectBounds) {
+  const subject = subjectBounds
+    ? { x: subjectBounds.x / 100, y: subjectBounds.y / 100, w: subjectBounds.w / 100, h: subjectBounds.h / 100 }
+    : { x: 0.15, y: 0.08, w: 0.7, h: 0.84 };
+  const faceX = subject.x + subject.w * 0.2;
+  const faceWidth = subject.w * 0.6;
+  const band = (top, bottom) => getDarkBandEvidence(data, width, height, {
+    x: faceX,
+    y: subject.y + subject.h * top,
+    w: faceWidth,
+    h: subject.h * (bottom - top),
+  });
+  // 眉毛只取眼睛上方的窄区域，并要求左右两处独立证据，避免斜眼被误判为眉毛。
+  const eyeFeatureBounds = { x: faceX, y: subject.y + subject.h * 0.25, w: faceWidth, h: subject.h * 0.28 };
+  const browToppedEyeCount = getDarkComponents(data, width, height, eyeFeatureBounds).filter((component) => (
+    component.componentHeight >= 6 && component.topWidth >= 4 && component.topWidth >= component.lowerWidth * 1.2
+  )).length;
+  const eyes = band(0.34, 0.53);
+  // 小 U 的弧形嘴位于脸部中下段，不能只取接近身体的下半区。
+  const mouth = band(0.42, 0.62);
+  const subjectHeight = subject.h * height;
+
+  return {
+    evidenceEnough: subjectHeight >= 54,
+    eyebrowPresent: hasSeparateEyebrowEvidence({ browToppedEyeCount }),
+    eyePairPresent: eyes.inkRatio >= 0.009 && eyes.runCount >= 2,
+    mouthPresent: mouth.inkRatio >= 0.004,
+  };
+}
+
 async function getBoxProfile(url, box) {
   const { width, height, image } = await readImageSize(url);
   const sx = clamp((box.x / 100) * width, 0, width - 1);
@@ -366,13 +478,95 @@ async function getBoxProfile(url, box) {
   fullContext.drawImage(image, 0, 0, fullCanvas.width, fullCanvas.height);
   const fullData = fullContext.getImageData(0, 0, fullCanvas.width, fullCanvas.height).data;
   const subjectBounds = getPurpleSubjectBounds(fullData, fullCanvas.width, fullCanvas.height);
+  const boxSubjectBounds = getPurpleSubjectBounds(data, canvas.width, canvas.height);
+  const boxProfile = getImageProfile(data);
   const fullProfile = getImageProfile(fullData);
   return {
-    ...getImageProfile(data),
+    ...boxProfile,
+    faceData: data,
+    faceWidth: canvas.width,
+    faceHeight: canvas.height,
+    boxSubjectBounds,
     subjectBounds,
+    boxLowerLimbCount: getLowerLimbCount(data, canvas.width, canvas.height, boxSubjectBounds),
+    boxSubjectAspect: boxSubjectBounds ? boxSubjectBounds.w / boxSubjectBounds.h : null,
+    boxLightBackgroundRatio: boxProfile.lightBackgroundRatio,
     lightBackgroundRatio: fullProfile.lightBackgroundRatio,
     lowerLimbCount: getLowerLimbCount(fullData, fullCanvas.width, fullCanvas.height, subjectBounds),
   };
+}
+
+function applyVisibleLimbVerdict(candidate, profile, auditType) {
+  if (auditType === "line" || candidate.status === "fail" || trustedSources.has(candidate.source)) return candidate;
+  const verdict = getVisibleLimbVerdict({
+    lowerLimbCount: profile.boxLowerLimbCount,
+    subjectAspect: profile.boxSubjectAspect,
+    lightBackgroundRatio: profile.boxLightBackgroundRatio,
+  });
+  if (verdict.state === "fail") {
+    return {
+      ...candidate,
+      status: "fail",
+      score: 48,
+      checks: candidate.checks.map((check) => check.id === "limbs" ? { ...check, ...verdict } : check),
+      reasons: [
+        `当前框内仅检测到 ${profile.boxLowerLimbCount} 个下肢支撑区域，且画面没有明显遮挡`,
+        "本次按下肢缺失判定为硬性不通过，不能由轮廓和配色高分抵消；手指数量与手部细节仍需人工确认或接入视觉模型",
+        ...candidate.reasons,
+      ],
+    };
+  }
+  const checks = candidate.checks.map((check) => check.id === "limbs" ? { ...check, ...verdict } : check);
+  return {
+    ...candidate,
+    score: calculateAuditScore(checks, candidate.score),
+    checks,
+  };
+}
+
+function applyFaceVerdict(candidate, profile) {
+  if (candidate.status === "fail") return candidate;
+  const signals = getFaceFeatureSignals(profile.faceData, profile.faceWidth, profile.faceHeight, profile.boxSubjectBounds);
+  const verdict = getFaceFeatureVerdict({
+    pose: candidate.pose,
+    ...signals,
+  });
+  const checks = candidate.checks.map((check) => check.id === "face" ? { ...check, ...verdict } : check);
+  if (verdict.state !== "fail") {
+    return { ...candidate, checks, score: calculateAuditScore(checks, candidate.score) };
+  }
+  return {
+    ...candidate,
+    status: "fail",
+    checks,
+    score: Math.min(60, calculateAuditScore(checks, candidate.score)),
+    reasons: [verdict.note, ...candidate.reasons],
+  };
+}
+
+async function applyVisibleLimbChecks(url, auditType, candidates) {
+  if (auditType === "line") return candidates;
+  return Promise.all(candidates.map(async (candidate) => {
+    if (candidate.status === "fail" || trustedSources.has(candidate.source)) return candidate;
+    try {
+      const profile = await getBoxProfile(url, candidate.box);
+      return applyVisibleLimbVerdict(candidate, profile, auditType);
+    } catch {
+      return candidate;
+    }
+  }));
+}
+
+async function applyFaceChecks(url, candidates) {
+  return Promise.all(candidates.map(async (candidate) => {
+    if (candidate.status === "fail") return candidate;
+    try {
+      const profile = await getBoxProfile(url, candidate.box);
+      return applyFaceVerdict(candidate, profile);
+    } catch {
+      return candidate;
+    }
+  }));
 }
 
 function makeLowEvidenceCandidate({ id, type, pose, box, reason }) {
@@ -439,12 +633,17 @@ async function recheckCandidateInBox(url, auditType, candidate, box) {
     });
   }
 
-  if (subjectCoverage !== null && subjectCoverage < 0.76) {
+  if (subjectCoverage !== null && isHeadOnlyFrame(subjectCoverage, profile.boxLowerLimbCount)) {
     return makePartialFrameCandidate({ id: candidate.id, type: auditType, pose: candidate.pose, box, coverage: subjectCoverage });
   }
 
-  if (hasPurpleBody && hasUnoccludedLowerLimbFailure(profile)) {
-    return makeMissingLimbCandidate({ id: candidate.id, type: auditType, pose: candidate.pose, box, lowerLimbCount: profile.lowerLimbCount });
+  const limbVerdict = auditType === "line" ? null : getVisibleLimbVerdict({
+    lowerLimbCount: profile.boxLowerLimbCount,
+    subjectAspect: profile.boxSubjectAspect,
+    lightBackgroundRatio: profile.boxLightBackgroundRatio,
+  });
+  if (hasPurpleBody && limbVerdict?.state === "fail") {
+    return makeMissingLimbCandidate({ id: candidate.id, type: auditType, pose: candidate.pose, box, lowerLimbCount: profile.boxLowerLimbCount });
   }
 
   if (auditType === "line") {
@@ -452,7 +651,10 @@ async function recheckCandidateInBox(url, auditType, candidate, box) {
       return makeLineTypeMismatchCandidate({ id: candidate.id, type: auditType, pose: candidate.pose, box });
     }
     const confidence = clamp(Math.round(62 + profile.darkLineRatio * 780), 62, 88);
-    return makeCandidate({ id: candidate.id, type: auditType, pose: candidate.pose, confidence, score: clamp(confidence + 2, 66, 86), source: "manual", box });
+    return applyFaceVerdict(
+      makeCandidate({ id: candidate.id, type: auditType, pose: candidate.pose, confidence, score: clamp(confidence + 2, 66, 86), source: "manual", box }),
+      profile,
+    );
   }
 
   if (isLineLike && !hasPurpleBody) {
@@ -470,7 +672,14 @@ async function recheckCandidateInBox(url, auditType, candidate, box) {
   }
 
   const confidence = clamp(Math.round(58 + profile.purpleRatio * 650 + profile.colorfulRatio * 80), 62, 90);
-  return makeCandidate({ id: candidate.id, type: auditType, pose: candidate.pose, confidence, score: clamp(confidence + 3, 68, 90), source: "manual", box });
+  return applyFaceVerdict(
+    applyVisibleLimbVerdict(
+      makeCandidate({ id: candidate.id, type: auditType, pose: candidate.pose, confidence, score: clamp(confidence + 3, 68, 90), source: "manual", box }),
+      profile,
+      auditType,
+    ),
+    profile,
+  );
 }
 
 async function detectPurpleRegions(url, type) {
@@ -680,7 +889,9 @@ export function App() {
     setLoading(true); setImageUrl(url); setFileName(name); setCandidates([]); setSelectedId(null);
     try {
       const result = await detectPurpleRegions(url, auditType);
-      const strictResult = applyStrictRenderChecks(result, auditType);
+      const limbCheckedResult = await applyVisibleLimbChecks(url, auditType, result);
+      const faceCheckedResult = await applyFaceChecks(url, limbCheckedResult);
+      const strictResult = applyStrictRenderChecks(faceCheckedResult, auditType);
       window.setTimeout(() => { const audited = applyIssueLibrary(strictResult, issueLibrary); setCandidates(audited); setSelectedId(audited[0]?.id ?? null); setLoading(false); }, 650);
     } catch {
       const fallback = applyStrictRenderChecks([makeCandidate({ id: 1, type: auditType, confidence: 55, score: 75, box: { x: 24, y: 18, w: 52, h: 64 } })], auditType);
